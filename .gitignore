@@ -1,0 +1,15 @@
+# Node.js
+node_modules/
+bot/node_modules/
+
+# Python
+.venv/
+
+# Ambiente
+.env
+*.log
+
+# Build/IDE
+dist/
+build/
+.idea/
