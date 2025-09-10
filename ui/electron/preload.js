@@ -1,2 +1,5 @@
-const { contextBridge } = require("electron");
-contextBridge.exposeInMainWorld("electronAPI", { ok: true });
+const { contextBridge, ipcRenderer } = require("electron");
+
+contextBridge.exposeInMainWorld("electronAPI", {
+  fetch: (path, init) => ipcRenderer.invoke("api:fetch", { path, init }),
+});
