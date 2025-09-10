@@ -1,11 +1,12 @@
 import os, re, subprocess
-from typing import Optional
+from typing import Optional, List, Dict, Any
 
 from fastapi import FastAPI, Query, HTTPException
 from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
 
 from player import player
-from track_queue import queue, Track  # usa teu track_queue.py local
+from track_queue import queue, Track
 from library import (
     rescan as lib_rescan,
     search as lib_search,
@@ -16,18 +17,100 @@ from library import (
 
 app = FastAPI(title="Midia Orchestrator")
 
+# CORS (uma única vez)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],      # simples para dev/Electron
+    allow_credentials=False,  # se True, NÃO pode usar "*"
+    allow_methods=["*"],
+    allow_headers=["*"],
+    max_age=86400,
+)
+
+# Utils
 def is_url(s: str) -> bool:
     return re.match(r'https?://', s or '') is not None
 
+# =========================
+# Models para Status/Queue
+# =========================
+class CurrentTrack(BaseModel):
+    id: Optional[str] = None
+    title: Optional[str] = None
+    requested_by: Optional[str] = None
+    source: Optional[str] = None  # "yt" | "file" | etc.
 
-from fastapi.middleware.cors import CORSMiddleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://127.0.0.1:5173","http://localhost:5173"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+class StatusResponse(BaseModel):
+    is_playing: bool
+    volume: int
+    current_track: Optional[CurrentTrack] = None
+
+class QueueItem(BaseModel):
+    id: Optional[str] = None
+    title: Optional[str] = None
+    requested_by: Optional[str] = None
+    is_playing: bool = False
+
+class QueueResponse(BaseModel):
+    queue: List[QueueItem]
+
+def _safe_get_volume() -> int:
+    try:
+        vol = player.mpv.get_property('volume')  # type: ignore[attr-defined]
+        return int(round(float(vol or 50)))
+    except Exception:
+        return 50
+
+def _safe_get_is_playing() -> bool:
+    try:
+        pause = player.mpv.get_property('pause')  # True = pausado
+        return not bool(pause)
+    except Exception:
+        return False
+
+def _safe_get_current() -> Optional[CurrentTrack]:
+    try:
+        title = player.mpv.get_property('media-title')
+    except Exception:
+        title = None
+    cur = getattr(player, "current", None)
+    if isinstance(cur, dict):
+        return CurrentTrack(
+            id=cur.get("id"),
+            title=cur.get("title") or title,
+            requested_by=cur.get("requested_by"),
+            source=cur.get("source"),
+        )
+    if title:
+        return CurrentTrack(title=title)
+    return None
+
+def _safe_get_queue(limit: int) -> List[QueueItem]:
+    q: List[QueueItem] = []
+    # Tenta fila própria do player (se você já preenche player.queue)
+    if hasattr(player, "queue") and isinstance(player.queue, list):  # type: ignore[attr-defined]
+        for it in player.queue[:limit]:  # type: ignore[index]
+            q.append(QueueItem(
+                id=it.get("id"),
+                title=it.get("title"),
+                requested_by=it.get("requested_by"),
+                is_playing=bool(it.get("is_playing", False)),
+            ))
+        return q
+    # Fallback: playlist do mpv
+    try:
+        playlist: list[Dict[str, Any]] = player.mpv.get_property('playlist')  # type: ignore[attr-defined]
+        for entry in (playlist or [])[:limit]:
+            title = entry.get("title") or entry.get("filename")
+            q.append(QueueItem(
+                id=str(entry.get("id")) if entry.get("id") is not None else None,
+                title=title,
+                is_playing=bool(entry.get("current", False)),
+            ))
+        return q
+    except Exception:
+        return []
+
 # =========================
 # Playback (stream / control)
 # =========================
@@ -41,6 +124,7 @@ def enqueue(req: EnqueueReq):
     if not q:
         raise HTTPException(400, "query vazia")
     if not is_url(q):
+        # Front pede confirmação quando não for URL (ex.: busca por texto)
         return {"ok": False, "error": "confirmacao_required"}
     player.load(q, append=True)
     return {"ok": True, "title": q}
@@ -60,14 +144,11 @@ def prev_track():
     player.prev()
     return {"ok": True}
 
+# Mantém POST /volume para compatibilidade
 @app.post("/volume")
-def set_volume(value: int = Query(..., ge=0, le=100)):
+def set_volume_post(value: int = Query(..., ge=0, le=100)):
     player.volume(value)
     return {"ok": True, "volume": value}
-
-@app.get("/queue")
-def list_queue():
-    return {"ok": True, "playlist": player.playlist()}
 
 # =========================
 # YouTube search / play
@@ -154,3 +235,24 @@ def library_import(req: ImportReq):
 def library_label(code: str, label: str):
     update_label(code, label)
     return {"ok": True}
+
+# =========================
+# Novos endpoints de Status/Queue/Volume (GET)
+# =========================
+@app.get("/status", response_model=StatusResponse)
+def get_status():
+    return StatusResponse(
+        is_playing=_safe_get_is_playing(),
+        volume=_safe_get_volume(),
+        current_track=_safe_get_current(),
+    )
+
+@app.get("/queue", response_model=QueueResponse)
+def get_queue(limit: int = 5):
+    items = _safe_get_queue(limit)
+    return QueueResponse(queue=items)
+
+@app.get("/volume")
+def set_volume_get(value: int = Query(..., ge=0, le=100)):
+    player.volume(value)
+    return {"ok": True, "volume": value}
