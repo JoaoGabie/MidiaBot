@@ -6,40 +6,43 @@ const fs      = require('fs');
 const path    = require('path');
 
 const SERVER = 'http://127.0.0.1:8000';
-const ALLOWED_CHAT = null; // opcional: se quiser restringir a um chat
+const ALLOWED_CHAT = null; // se quiser restringir a um chat ID
 const MEDIA_DIR = path.join(__dirname, '..', 'media');
 if (!fs.existsSync(MEDIA_DIR)) fs.mkdirSync(MEDIA_DIR, { recursive: true });
 
 const client = new Client({ authStrategy: new LocalAuth() });
 
+// ====== Flags/Helpers ======
+const REQUIRE_PREFIX_IN_GROUP = true;               // Em grupo só responde quando mencionado
+const DM_HELP_COOLDOWN_MS     = 12 * 60 * 60 * 1000;
+const dmHelpMemory = new Map();                     // userId -> timestamp
+const pending = new Map();                          // chatId -> [results]
+let MY_WID = null;                                  // id do próprio bot (wid serializado)
+
+// ====== Eventos básicos ======
 client.on('qr', (qr) => {
   qrcode.generate(qr, { small: true });
   console.log('📱 Escaneia o QR pra logar no WhatsApp Web');
 });
 client.on('authenticated', () => console.log('🔐 Authenticated'));
-client.on('ready',        () => console.log('✅ Client ready'));
-client.on('auth_failure', m  => console.log('❌ Auth failure:', m));
-client.on('disconnected', r  => console.log('🔌 Disconnected:', r));
-client.on('change_state', s  => console.log('🔄 State:', s));
+client.on('ready', () => {
+  console.log('✅ Client ready');
+  try {
+    // Ex.: '557199999999@c.us'
+    MY_WID = client.info?.wid?._serialized || null;
+    console.log('🤖 My WID:', MY_WID);
+  } catch (e) {
+    console.log('⚠️ Não consegui ler MY_WID:', e);
+  }
+});
+client.on('auth_failure', m => console.log('❌ Auth failure:', m));
+client.on('disconnected', r => console.log('🔌 Disconnected:', r));
+client.on('change_state', s => console.log('🔄 State:', s));
 client.on('loading_screen', (p,msg) => console.log('⏳ Loading:', p, msg||''));
 
-// ====== Flags/Helpers ======
-const REQUIRE_PREFIX_IN_GROUP = true;                  // Em grupo: exige @bot
-const DM_HELP_COOLDOWN_MS     = 12 * 60 * 60 * 1000;   // 12h
-const dmHelpMemory = new Map();                        // userId -> timestamp
-
+// ====== Utils ======
 function isUrl(s){ return /^https?:\/\//i.test(s || ''); }
 function isLocalId(s){ s=(s||'').trim(); return /^#?\d{1,4}$/.test(s) || /^[A-Za-z]\d{3,}$/.test(s); }
-
-// Parser com @bot (para grupos)
-function cmd(text) {
-  const m = (text || '').trim();
-  if (!m.toLowerCase().startsWith('@bot')) return null;
-  const parts = m.slice(4).trim().split(/\s+/);
-  const name = (parts.shift() || '').toLowerCase();
-  const rest = parts.join(' ');
-  return { name, rest };
-}
 
 // Parser “natural” para DM (sem @bot)
 function parseDmIntent(text) {
@@ -68,12 +71,28 @@ function parseDmIntent(text) {
   return null;
 }
 
-const pending = new Map(); // chatId -> [results]
+// Grupo: detectar menção real ao bot
+async function isBotMentioned(msg) {
+  try {
+    if (!MY_WID) return false;
+    const mentions = await msg.getMentions(); // array Contacts
+    return mentions.some(c => (c.id?._serialized) === MY_WID);
+  } catch (e) {
+    console.log('⚠️ getMentions falhou:', e);
+    return false;
+  }
+}
+
+// Remove menções no início da mensagem (ex.: "@Fulano @Bot comando ...")
+function stripLeadingMentions(body) {
+  let m = (body || '').trim();
+  return m.replace(/^(@\S+\s*)+/, '').trim();
+}
 
 // ====== Listener principal ======
 client.on('message', async msg => {
   try {
-    console.log(`📩 Msg recebida de ${msg.from}: "${msg.body}"`);
+    console.log(`📩 De ${msg.from}: "${msg.body}"`);
 
     if (ALLOWED_CHAT && msg.from !== ALLOWED_CHAT) {
       console.log(`🚫 Ignorado (chat não autorizado: ${msg.from})`);
@@ -84,11 +103,9 @@ client.on('message', async msg => {
     const isGroup = chat.isGroup;
 
     // ===== Upload de mídia (áudio) =====
-    // DM: aceita sem @bot | Grupo: só se a mensagem começar com @bot
+    // DM: aceita sem menção | Grupo: só se mencionar o bot
     if (msg.hasMedia) {
-      const raw = (msg.body || '').trim().toLowerCase();
-      const mentioned = raw.startsWith('@bot');
-      const proceed = !isGroup || (isGroup && mentioned);
+      const proceed = !isGroup || (isGroup && await isBotMentioned(msg));
       if (proceed) {
         console.log('📥 Recebido arquivo de mídia');
         const media = await msg.downloadMedia();
@@ -104,14 +121,14 @@ client.on('message', async msg => {
         await axios.post(`${SERVER}/library/import`, { id, file, label: null });
         await msg.reply(
           `📥 áudio recebido (${ext}). ID: ${id}\n` +
-          `Defina rótulo: ${isGroup ? '@bot ' : ''}rotulo ${id} <texto>\n` +
-          `Tocar: ${isGroup ? '@bot ' : ''}tocar ${id}`
+          `Defina rótulo: rotulo ${id} <texto>\n` +
+          `Tocar: tocar ${id}`
         );
         return;
       }
     }
 
-    // ===== Seleção por número / sair (precisa vir antes do cmd(...)) =====
+    // ===== Seleção por número / sair (precisa vir ANTES do parsing) =====
     {
       const raw = (msg.body || '').trim();
       const isNumberOnly = /^\d+$/.test(raw);
@@ -147,16 +164,26 @@ client.on('message', async msg => {
 
     // ===== Parsing de comandos =====
     let c = null;
+
     if (isGroup && REQUIRE_PREFIX_IN_GROUP) {
-      // Grupo: exige @bot
-      c = cmd(msg.body);
-      if (!c) {
-        console.log('ℹ️ Grupo: sem @bot → ignorado');
+      // Grupo: só responde se o bot for mencionado
+      const mentioned = await isBotMentioned(msg);
+      if (!mentioned) {
+        console.log('ℹ️ Grupo: bot não foi mencionado → ignorado');
+        return;
+      }
+      // Remove menções e interpreta o primeiro token como comando
+      const cleaned = stripLeadingMentions(msg.body);
+      const parts = (cleaned || '').split(/\s+/);
+      const name = (parts.shift() || '').toLowerCase();
+      c = { name, rest: parts.join(' ') };
+      if (!c.name) {
+        await msg.reply('👋 Me mencionou? Envie um comando. Ex.: *tocar <termo>*');
         return;
       }
     } else {
       // DM: aceita sem @bot (parser natural) e também aceita @bot se usar
-      c = parseDmIntent(msg.body) || cmd(msg.body);
+      c = parseDmIntent(msg.body);
       if (!c) {
         const last = dmHelpMemory.get(msg.from) || 0;
         const now  = Date.now();
@@ -176,45 +203,41 @@ client.on('message', async msg => {
       }
     }
 
-    console.log(`⚙️ Comando detectado: ${c.name}, args: ${c.rest || ''}`);
+    console.log(`⚙️ Comando: ${c.name} | Args: ${c.rest || ''}`);
 
     // ===== Execução =====
+    if (c.name === 'ajuda' || c.name === 'help') {
+      return msg.reply(
+        `📖 *Comandos:*\n` +
+        `tocar <url|#id|texto>\n` +
+        `Após a busca: *digite o número* (1–5) ou *sair*\n` +
+        `soltar (ou play/pause)\n` +
+        `pular\n` +
+        `volume <0-100>\n` +
+        `fila\n` +
+        `limpar\n` +
+        `rotulo <ID> <texto>`
+      );
+    }
+
     if (c.name === 'rotulo') {
       const [code, ...rest] = (c.rest || '').split(/\s+/);
       const label = (rest.join(' ') || '').trim();
-      if (!code || !label) return msg.reply(`${isGroup ? '@bot ' : ''}rotulo <ID> <rótulo>`);
-      console.log(`🏷️ Atualizando rótulo ${code} -> ${label}`);
+      if (!code || !label) return msg.reply('Use: rotulo <ID> <rótulo>');
       await axios.post(`${SERVER}/library/label`, null, { params: { code, label }});
       return msg.reply(`✅ rótulo de ${code} atualizado`);
-    }
-
-    if (c.name === 'ajuda' || c.name === 'help') {
-      return msg.reply(
-        `📖 *Comandos disponíveis:*\n` +
-        `${isGroup ? '@bot ' : ''}tocar <url|#id|texto>\n` +
-        `Após a busca: *digite o número* (1–5) ou *sair*\n` +
-        `${isGroup ? '@bot ' : ''}soltar (ou play/pause)\n` +
-        `${isGroup ? '@bot ' : ''}pular\n` +
-        `${isGroup ? '@bot ' : ''}volume <0-100>\n` +
-        `${isGroup ? '@bot ' : ''}fila\n` +
-        `${isGroup ? '@bot ' : ''}limpar\n` +
-        `${isGroup ? '@bot ' : ''}rotulo <ID> <texto>\n` +
-        `${isGroup ? '@bot ' : ''}ajuda`
-      );
     }
 
     if (c.name === 'tocar' && c.rest) {
       const q = c.rest.trim();
 
       if (isUrl(q)) {
-        console.log(`🎵 Tocar URL: ${q}`);
         const r = await axios.post(`${SERVER}/queue`, { query: q, requested_by: msg.author || msg.from });
         if (!r.data.ok) return msg.reply('❌ não consegui tocar (confirmação requerida).');
         return msg.reply('▶️ streaming...');
       }
 
       if (isLocalId(q)) {
-        console.log(`🎵 Tocar por ID local: ${q}`);
         const s = await axios.post(`${SERVER}/library/search`, { query: q, limit: 1 });
         if (!s.data.results.length) return msg.reply('ID não encontrado.');
         await axios.post(`${SERVER}/queue/by-id`, { db_id: s.data.results[0].db_id });
@@ -224,7 +247,6 @@ client.on('message', async msg => {
       // Aviso de latência antes da busca
       await msg.reply('🔎 Pesquisando no YouTube…');
 
-      console.log(`🔍 Procurando no YouTube: ${q}`);
       const find = await axios.post(`${SERVER}/yt/search`, { query: q, limit: 5 });
       if (!find.data.ok || !find.data.results.length) {
         return msg.reply(
@@ -258,8 +280,8 @@ client.on('message', async msg => {
 
     if (c.name === 'volume') {
       const v = parseInt((c.rest||''),10);
-      if (isNaN(v)) return msg.reply(`${isGroup ? '@bot ' : ''}volume 0-100`);
-      // Mantendo seu POST com params (como no código original)
+      if (isNaN(v)) return msg.reply('Use: volume 0-100');
+      // mantém POST com params, como no teu backend
       await axios.post(`${SERVER}/volume`, null, { params:{ value:v } });
       return msg.reply(`🔊 volume ${v}%`);
     }
@@ -280,16 +302,13 @@ client.on('message', async msg => {
 
     // Fallback
     await msg.reply(
-      `Comandos: ${isGroup ? '@bot ' : ''}tocar <url|#id|texto> | ` +
-      `após a busca *número* (1–5) ou *sair* | ` +
-      `${isGroup ? '@bot ' : ''}soltar | ${isGroup ? '@bot ' : ''}pular | ` +
-      `${isGroup ? '@bot ' : ''}volume <0-100> | ${isGroup ? '@bot ' : ''}fila | ` +
-      `${isGroup ? '@bot ' : ''}limpar | ${isGroup ? '@bot ' : ''}rotulo <ID> <texto>`
+      `Comandos: tocar <url|#id|texto> | após a busca *número* (1–5) ou *sair* | ` +
+      `soltar | pular | volume <0-100> | fila | limpar | rotulo <ID> <texto>`
     );
 
   } catch (e) {
     console.error('💥 Erro ao processar comando:', e);
-    await msg.reply('❌ erro ao processar comando');
+    try { await msg.reply('❌ erro ao processar comando'); } catch {}
   }
 });
 
