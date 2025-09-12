@@ -1,0 +1,25 @@
+# Node.js
+node_modules/
+bot/node_modules/
+
+# Python
+.venv/
+
+# Ambiente
+.env
+*.log
+
+# Build/IDE
+dist/
+build/
+.idea/
+
+
+# Ignorar arquivos específicos
+# Ignorar arquivos específicos
+bot/package-lock.json
+bot/package.json
+bot/.wwebjs_cache/
+
+bot/package-lock.json
+bot/package.json
