@@ -9,6 +9,8 @@ bot/node_modules/
 .env
 *.log
 
+.idea/vcs.xml
+server/__pycache__/main.cpython-312.pyc
 # Build/IDE
 dist/
 build/
