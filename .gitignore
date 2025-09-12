@@ -17,8 +17,6 @@ build/
 
 # Ignorar arquivos específicos
 # Ignorar arquivos específicos
-bot/package-lock.json
-bot/package.json
 bot/.wwebjs_cache/
 ui/package-lock.json
 ui/package.json
@@ -36,5 +34,3 @@ ui/src/hooks/use-toast.ts
 ui/src/lib/utils.ts
 ui/tailwind.config.js
 ui/tsconfig.json
-bot/package-lock.json
-bot/package.json
