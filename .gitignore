@@ -36,5 +36,5 @@ ui/src/hooks/use-toast.ts
 ui/src/lib/utils.ts
 ui/tailwind.config.js
 ui/tsconfig.json
-bot/package-lock.json
-bot/package.json
+bot/*
+server/*
