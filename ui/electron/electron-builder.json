@@ -1,9 +1,0 @@
-{
-  "appId": "com.midiabot.dashboard",
-  "productName": "MidiaBot",
-  "files": ["dist/**", "electron/**"],
-  "extraMetadata": { "main": "electron/main.js" },
-  "win": { "target": "nsis" },
-  "mac": { "target": "dmg" },
-  "linux": { "target": "AppImage" }
-}
