@@ -38,3 +38,4 @@ ui/tailwind.config.js
 ui/tsconfig.json
 bot/package-lock.json
 bot/package.json
+__pycache__/
